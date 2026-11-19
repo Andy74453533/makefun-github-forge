@@ -384,8 +384,54 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; next: number
  * OFS_DELTA and REF_DELTA entries. `resolveBase` supplies a base object a
  * thin pack leaves out. The trailer checksum is verified. Throws
  * PackError on any corruption.
+ *
+ * Most packs the forge reads are delta-free (the suite builds them with
+ * full objects only): those take a fast path that inflates and hashes
+ * each entry directly, without the delta-resolution bookkeeping. Any
+ * delta entry falls back to the full reader below.
  */
 export function readPack(pack: Uint8Array, options: { resolveBase?: ObjectLookup } = {}): Map<string, GitObject> {
+  const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
+  if (buffer.length < 32) throw new PackError(`pack is ${buffer.length} bytes, too short`);
+  if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') throw new PackError('pack does not start with PACK');
+  const version = buffer.readUInt32BE(4);
+  if (version !== 2 && version !== 3) throw new PackError(`unsupported pack version ${version}`);
+  const declaredCount = buffer.readUInt32BE(8);
+  const trailerStart = buffer.length - 20;
+  const trailer = buffer.subarray(trailerStart).toString('hex');
+  const computedTrailer = sha1Hex(buffer.subarray(0, trailerStart));
+  if (trailer !== computedTrailer) throw new PackError('pack trailer does not match its bytes');
+
+  const objects = new Map<string, GitObject>();
+  let offset = 12;
+  for (let index = 0; index < declaredCount; index += 1) {
+    const entryOffset = offset;
+    const header = readPackEntryHeader(buffer, offset);
+    offset = header.next;
+    const typeCode = (header.first >> 4) & 0x07;
+    if (typeCode === 6 || typeCode === 7) return readPackFull(pack, options);
+    const type = CODE_TYPE[typeCode];
+    if (type === undefined) {
+      throw new PackError(`pack entry ${index} has unknown type code ${typeCode}`);
+    }
+    const inflated = inflateAt(buffer.subarray(0, trailerStart), offset);
+    if (inflated.data.length !== header.size) {
+      throw new PackError(
+        `pack entry at ${entryOffset} declares ${header.size} bytes but inflated to ${inflated.data.length}`,
+      );
+    }
+    offset = inflated.next;
+    const oid = hashObject(type, inflated.data);
+    if (!objects.has(oid)) objects.set(oid, { type, data: inflated.data });
+  }
+  if (offset !== trailerStart) {
+    throw new PackError(`pack has ${trailerStart - offset} stray bytes before its trailer`);
+  }
+  return objects;
+}
+
+/** The full pack reader: entry headers, delta resolution, trailer checks. */
+function readPackFull(pack: Uint8Array, options: { resolveBase?: ObjectLookup } = {}): Map<string, GitObject> {
   const buffer = Buffer.isBuffer(pack) ? pack : Buffer.from(pack);
   if (buffer.length < 32) throw new PackError(`pack is ${buffer.length} bytes, too short`);
   if (buffer.subarray(0, 4).toString('ascii') !== 'PACK') throw new PackError('pack does not start with PACK');
@@ -520,7 +566,10 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   parts.push(header);
   for (const object of list) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    // Level 1 is enough for a valid zlib stream and is far cheaper than
+    // the default: packs are built per fetch, and the reader only needs
+    // a stream it can inflate.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
