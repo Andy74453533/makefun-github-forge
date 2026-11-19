@@ -9,6 +9,36 @@ import { Forge, DEFAULT_BRANCH, type PushCommand, type RepoRecord } from './stor
 /** The agent string the forge advertises in capability lists. */
 export const AGENT = 'github-forge/1.0.0';
 
+/**
+ * Per-repo caches of fully-built git responses, keyed by repo version +
+ * request. The 50 concurrent clones of one repo ask for the same fetch,
+ * ls-refs and advertisement over and over: the first builds the bytes,
+ * the rest reuse them. Entries are derived purely from repo state, so a
+ * version bump (any object or ref change) retires them; they are never
+ * part of the store or its export.
+ */
+interface GitResponseCache {
+  fetch: Map<string, Buffer>;
+  refs: Map<string, Buffer>;
+}
+const gitCaches = new WeakMap<RepoRecord, GitResponseCache>();
+const GIT_CACHE_MAX = 32;
+function gitCacheFor(repo: RepoRecord): GitResponseCache {
+  let cache = gitCaches.get(repo);
+  if (cache === undefined) {
+    cache = { fetch: new Map(), refs: new Map() };
+    gitCaches.set(repo, cache);
+  }
+  return cache;
+}
+function cachePut(cache: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (cache.size >= GIT_CACHE_MAX) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+  cache.set(key, value);
+}
+
 /** An HTTP error the git handlers raise: status plus a short body. */
 export class GitHttpError extends Error {
   readonly status: number;
@@ -163,17 +193,19 @@ function v0UploadAdvertisement(forge: Forge, repo: RepoRecord): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The protocol-v2 advertisement never varies: build it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine(`agent=${AGENT}\n`),
+  flushPkt(),
+]);
+
 /** The protocol-v2 advertisement. */
 function v2Advertisement(): Buffer {
-  const parts: Buffer[] = [
-    pktLine('version 2\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine(`agent=${AGENT}\n`),
-    flushPkt(),
-  ];
-  return Buffer.concat(parts);
+  return V2_ADVERTISEMENT;
 }
 
 /** The v0 receive-pack advertisement (receive-pack never speaks v2 here). */
@@ -202,18 +234,29 @@ export function handleInfoRefs(
   gitProtocol: string | undefined,
 ): { status: number; contentType: string; body: Buffer } {
   if (service === 'git-upload-pack') {
-    const body =
-      gitProtocol !== undefined && gitProtocol.split(',').map((part) => part.trim()).includes('version=2')
-        ? v2Advertisement()
-        : v0UploadAdvertisement(forge, repo);
+    if (gitProtocol !== undefined && gitProtocol.split(',').map((part) => part.trim()).includes('version=2')) {
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
+    }
+    const cache = gitCacheFor(repo).refs;
+    const key = `v${repo.version}|upload-v0`;
+    const hit = cache.get(key);
+    if (hit !== undefined) {
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: hit };
+    }
+    const body = v0UploadAdvertisement(forge, repo);
+    cachePut(cache, key, body);
     return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
   }
   if (service === 'git-receive-pack') {
-    return {
-      status: 200,
-      contentType: 'application/x-git-receive-pack-advertisement',
-      body: v0ReceiveAdvertisement(forge, repo),
-    };
+    const cache = gitCacheFor(repo).refs;
+    const key = `v${repo.version}|receive-v0`;
+    const hit = cache.get(key);
+    if (hit !== undefined) {
+      return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: hit };
+    }
+    const body = v0ReceiveAdvertisement(forge, repo);
+    cachePut(cache, key, body);
+    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body };
   }
   throw new GitHttpError(400, `unknown service ${JSON.stringify(service)}`);
 }
@@ -222,6 +265,21 @@ export function handleInfoRefs(
 
 /** Handle a v2 ls-refs command. */
 function handleLsRefs(
+  forge: Forge,
+  repo: RepoRecord,
+  args: readonly string[],
+): Buffer {
+  const cache = gitCacheFor(repo).refs;
+  const key = `v${repo.version}|ls-refs|${args.join('\n')}`;
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const body = buildLsRefs(forge, repo, args);
+  cachePut(cache, key, body);
+  return body;
+}
+
+/** Build a v2 ls-refs reply (uncached). */
+function buildLsRefs(
   forge: Forge,
   repo: RepoRecord,
   args: readonly string[],
@@ -271,6 +329,24 @@ function handleV2Fetch(forge: Forge, repo: RepoRecord, args: readonly string[]):
     }
     // thin-pack, no-progress, ofs-delta, filter and friends: accepted, ignored.
   }
+  const cache = gitCacheFor(repo).fetch;
+  const key = `v${repo.version}|fetch-v2|${wants.join(',')}|${haves.join(',')}|${shallows.join(',')}|${depth ?? ''}`;
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const body = buildV2Fetch(forge, repo, wants, haves, shallows, depth);
+  cachePut(cache, key, body);
+  return body;
+}
+
+/** Build a v2 fetch reply (uncached). */
+function buildV2Fetch(
+  forge: Forge,
+  repo: RepoRecord,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallows: readonly string[],
+  depth: number | null,
+): Buffer {
   const plan = forge.computeFetch(repo, { wants, haves, shallow: shallows, depth });
   const parts: Buffer[] = [];
   // Each section opens with its header line and closes with a delim.
@@ -319,6 +395,24 @@ function handleV0Fetch(forge: Forge, repo: RepoRecord, lines: readonly PktLine[]
       if (Number.isInteger(parsed) && parsed > 0) depth = parsed;
     }
   }
+  const cache = gitCacheFor(repo).fetch;
+  const key = `v${repo.version}|fetch-v0|${wants.join(',')}|${haves.join(',')}|${shallows.join(',')}|${depth ?? ''}`;
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const body = buildV0Fetch(forge, repo, wants, haves, shallows, depth);
+  cachePut(cache, key, body);
+  return body;
+}
+
+/** Build a v0 fetch reply (uncached). */
+function buildV0Fetch(
+  forge: Forge,
+  repo: RepoRecord,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallows: readonly string[],
+  depth: number | null,
+): Buffer {
   const plan = forge.computeFetch(repo, { wants, haves, shallow: shallows, depth });
   const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
