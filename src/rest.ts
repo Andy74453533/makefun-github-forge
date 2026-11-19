@@ -33,6 +33,12 @@ export interface RestResponse {
   readonly status: number;
   readonly headers: Record<string, string>;
   readonly json: unknown;
+  /**
+   * A pre-serialized JSON body, when set: the app sends these bytes as-is
+   * instead of stringifying `json` (which stays null there). Only for
+   * replies whose bytes are fully determined by a cache key.
+   */
+  readonly body?: Buffer;
 }
 
 /** An error the REST layer raises: an HTTP status and a message string. */
@@ -106,6 +112,29 @@ function labelObject(repo: RepoRecord, label: LabelRecord): Record<string, unkno
   };
 }
 
+/** The viewer's user object never changes: build it once, share it everywhere. */
+const VIEWER_USER_OBJECT = userObject(VIEWER);
+
+/** Serialized GET-issue bodies, keyed by repo + issue + its mutation stamp. */
+const issueJsonCache = new Map<string, Buffer>();
+const ISSUE_JSON_CACHE_MAX = 1024;
+
+/**
+ * A GET-issue reply's exact bytes. The key carries the issue's updatedAt
+ * (every update or comment ticks the clock) and its comment count, so any
+ * mutation misses the cache and re-serializes; labels are immutable once
+ * created, so nothing else in the reply can change under a live key.
+ */
+function cachedIssueJson(forge: Forge, repo: RepoRecord, issue: IssueRecord): Buffer {
+  const key = `${repo.dbid}:${issue.number}:${issue.updatedAt}:${issue.comments.length}`;
+  const hit = issueJsonCache.get(key);
+  if (hit !== undefined) return hit;
+  const body = Buffer.from(JSON.stringify(issueObject(forge, repo, issue)), 'utf8');
+  if (issueJsonCache.size >= ISSUE_JSON_CACHE_MAX) issueJsonCache.clear();
+  issueJsonCache.set(key, body);
+  return body;
+}
+
 /** A GitHub-shaped issue object. */
 export function issueObject(
   forge: Forge,
@@ -122,7 +151,7 @@ export function issueObject(
     body: issue.body,
     state: issue.state,
     locked: false,
-    user: userObject(VIEWER),
+    user: VIEWER_USER_OBJECT,
     labels: issue.labels.map((name) => {
       const label = repo.labels.get(name);
       return label === undefined
@@ -664,7 +693,7 @@ function handleGetIssue(forge: Forge, owner: string, name: string, number: numbe
   const repo = requireRepo(forge, owner, name);
   const issue = forge.getIssue(repo, number);
   if (issue === undefined) throw notFound('Not Found');
-  return { status: 200, headers: {}, json: issueObject(forge, repo, issue) };
+  return { status: 200, headers: {}, json: null, body: cachedIssueJson(forge, repo, issue) };
 }
 
 function handlePatchIssue(forge: Forge, request: RestRequest, owner: string, name: string, number: number): RestResponse {
