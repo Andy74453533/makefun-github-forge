@@ -99,6 +99,8 @@ export interface RepoRecord {
   readonly pulls: Map<number, PullRecord>;
   readonly labels: Map<string, LabelRecord>;
   nextNumber: number;
+  /** Mutation counter: every object/ref change bumps it, and the git layer's response caches key off it. */
+  version: number;
 }
 
 /** A flattened tree: every file path and the blob behind it. */
@@ -212,6 +214,7 @@ export class Forge {
       pulls: new Map(),
       labels: new Map(),
       nextNumber: 1,
+      version: 0,
     };
     this.nextDbid += 1;
     this.reposByKey.set(key, repo);
@@ -263,6 +266,11 @@ export class Forge {
     return mintGlobalId('IssueComment', [repo.dbid, comment.id]);
   }
 
+  /** Bump a repository's mutation version: every cached git response keys off it. */
+  private bumpVersion(repo: RepoRecord): void {
+    repo.version += 1;
+  }
+
   // ---------------------------------------------------------------- objects
 
   /** Store an object, returning its id. Commit headers are cached on the way in. */
@@ -271,6 +279,7 @@ export class Forge {
     const oid = hashObject(type, bytes);
     if (!repo.objects.has(oid)) {
       repo.objects.set(oid, { type, data: bytes });
+      this.bumpVersion(repo);
       if (type === 'commit') {
         const view = parseCommit(bytes);
         repo.commitHeaders.set(oid, { tree: view.tree, parents: view.parents });
@@ -284,6 +293,7 @@ export class Forge {
     for (const [oid, object] of objects) {
       if (!repo.objects.has(oid)) {
         repo.objects.set(oid, object);
+        this.bumpVersion(repo);
         if (object.type === 'commit') {
           const view = parseCommit(object.data);
           repo.commitHeaders.set(oid, { tree: view.tree, parents: view.parents });
@@ -351,11 +361,14 @@ export class Forge {
   /** Create or update a ref directly (REST refs endpoint). */
   setRef(repo: RepoRecord, refName: string, oid: string): void {
     repo.refs.set(refName, oid);
+    this.bumpVersion(repo);
   }
 
   /** Delete a ref; false when it did not exist. */
   deleteRef(repo: RepoRecord, refName: string): boolean {
-    return repo.refs.delete(refName);
+    const deleted = repo.refs.delete(refName);
+    if (deleted) this.bumpVersion(repo);
+    return deleted;
   }
 
   // ------------------------------------------------------------- trees/paths
@@ -698,6 +711,7 @@ export class Forge {
           results.push({ refName, ok: false, reason: 'old value does not match' });
         } else {
           repo.refs.delete(refName);
+          this.bumpVersion(repo);
           results.push({ refName, ok: true, reason: null });
         }
         continue;
@@ -712,6 +726,7 @@ export class Forge {
           results.push({ refName, ok: false, reason: 'old value does not match' });
         } else {
           repo.refs.set(refName, newOid);
+          this.bumpVersion(repo);
           results.push({ refName, ok: true, reason: null });
         }
         continue;
@@ -723,6 +738,7 @@ export class Forge {
       // Update: must be a fast-forward (tags peeled to their commits).
       if (newOid === current || this.isAncestor(repo, current, newOid)) {
         repo.refs.set(refName, newOid);
+        this.bumpVersion(repo);
         results.push({ refName, ok: true, reason: null });
       } else {
         results.push({ refName, ok: false, reason: 'non-fast-forward' });
@@ -813,8 +829,10 @@ export class Forge {
         }
       }
       const seenCommits = new Set<string>();
-      while (queue.length > 0) {
-        const { oid, distance } = queue.shift() as { oid: string; distance: number };
+      let head = 0;
+      while (head < queue.length) {
+        const { oid, distance } = queue[head] as { oid: string; distance: number };
+        head += 1;
         const known = commitDistance.get(oid);
         if (known !== undefined && known <= distance) continue;
         commitDistance.set(oid, distance);
@@ -865,8 +883,9 @@ export class Forge {
     }
 
     // Acknowledgements: haves that are ancestors of a want (full ancestry).
+    // With no haves there is nothing to acknowledge: skip the whole-chain walk.
     const ancestorsOfWants = new Set<string>();
-    {
+    if (request.haves.length > 0) {
       const queue: string[] = [];
       for (const want of request.wants) {
         const peeled = this.peel(repo, want);
@@ -1083,6 +1102,7 @@ export class Forge {
       : `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}`;
     const sha = this.createCommit(repo, { tree: outcome.treeOid, parents, message });
     repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+    this.bumpVersion(repo);
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedAt = this.clock.nextIso();
@@ -1108,7 +1128,10 @@ export class Forge {
     let tip = repo.refs.get(refName);
     if (tip === undefined && branch !== DEFAULT_BRANCH) {
       tip = this.defaultTip(repo);
-      if (tip !== undefined) repo.refs.set(refName, tip);
+      if (tip !== undefined) {
+        repo.refs.set(refName, tip);
+        this.bumpVersion(repo);
+      }
     }
     const blobSha = this.putObject(repo, 'blob', fields.content);
     let created = true;
@@ -1132,6 +1155,7 @@ export class Forge {
     const treeOid = this.setPathInTree(repo, parentTree, fields.path, blobSha);
     const commitSha = this.createCommit(repo, { tree: treeOid, parents, message: fields.message });
     repo.refs.set(refName, commitSha);
+    this.bumpVersion(repo);
     return { commitSha, blobSha, created };
   }
 
@@ -1156,6 +1180,7 @@ export class Forge {
     const treeOid = this.setPathInTree(repo, header?.tree ?? null, fields.path, null);
     const commitSha = this.createCommit(repo, { tree: treeOid, parents: [tip], message: fields.message });
     repo.refs.set(refName, commitSha);
+    this.bumpVersion(repo);
     return { commitSha };
   }
 }
